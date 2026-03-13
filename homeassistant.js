@@ -1,8 +1,7 @@
 export function Name() { return "Home Assistant Bridge"; }
-export function Version() { return "1.2.0"; }
+export function Version() { return "1.9.1"; }
 export function Type() { return "network"; }
 export function Publisher() { return "SignalRGB Community"; }
-export function Documentation() { return "gettingstarted/udp-device"; }
 export function Size() { return [10, 10]; }
 export function DefaultPosition() { return [0, 0]; }
 export function DefaultScale() { return 1.0; }
@@ -15,23 +14,18 @@ service:readonly
 device:readonly
 LightingMode:readonly
 forcedColor:readonly
-FPSLimit:readonly
-filterWLED:readonly
 */
 
 export function ControllableParameters() {
 	return [
-		{"property":"filterWLED", "group":"settings", "label":"Filter WLED/Clock", "type":"boolean", "default":true},
 		{"property":"LightingMode", "group":"settings", "label":"Lighting Mode", "type":"combobox", "values":["Canvas", "Forced"], "default":"Canvas"},
-		{"property":"forcedColor", "group":"settings", "label":"Forced Color", "type":"color", "default":"#009bde"},
-		{"property":"FPSLimit", "group":"settings", "label":"FPS Limit", "type":"number", "default":5, "min":1, "max":15}
+		{"property":"forcedColor", "group":"settings", "label":"Forced Color", "type":"color", "default":"#009bde"}
 	];
 }
 
 // -------------------------------------------<( Device Core Logic )>--------------------------------------------------
 
 let HA_DEVICE;
-let lastRenderTime = 0;
 
 class HomeAssistantDevice {
 	constructor(controllerData) {
@@ -44,11 +38,22 @@ class HomeAssistantDevice {
 
 	initializeChannels() {
 		if (!this.url || !this.token) return;
-		device.log("Fetching Home Assistant entities synchronously for channel setup...");
+		device.log("Initializing channels from the user's selected entity list...");
 		
-		const allowedLights = this.targetEntities ? this.targetEntities.split(',').map(s => s.trim().toLowerCase()).filter(s => s.length > 0) : [];
-		// Safe check for filterWLED in case UI properties crash
-		const isFilterEnabled = typeof filterWLED !== "undefined" ? filterWLED : true;
+		let allowedLights = {};
+		if (this.targetEntities) {
+			try {
+				allowedLights = JSON.parse(this.targetEntities);
+			} catch(e) {
+				const arr = this.targetEntities.split(',').map(s => s.trim().toLowerCase()).filter(s => s.length > 0);
+				arr.forEach(id => { allowedLights[id] = 5; });
+			}
+		}
+		
+		if (Object.keys(allowedLights).length === 0) {
+			device.log("No entities are currently selected for sync. Check your settings.");
+			return;
+		}
 
 		const xhr = new XMLHttpRequest();
 		xhr.open("GET", `${this.url}/api/states`, false); 
@@ -60,34 +65,24 @@ class HomeAssistantDevice {
 			xhr.send();
 			if (xhr.status === 200) {
 				const states = JSON.parse(xhr.response);
-				this.lights = []; // Clear existing in case of a live reload
+				this.lights = [];
 				
 				states.forEach(state => {
-					if (state.entity_id.startsWith("light.")) {
-						if (allowedLights.length > 0 && !allowedLights.includes(state.entity_id.toLowerCase())) {
-							return;
-						}
-
+					const entityId = state.entity_id.toLowerCase();
+					if (state.entity_id.startsWith("light.") && allowedLights.hasOwnProperty(entityId)) {
 						const attrs = state.attributes || {};
 						const friendlyName = attrs.friendly_name || state.entity_id;
 						const colorModes = attrs.supported_color_modes || [];
 
-						if (isFilterEnabled) {
-							const nameLower = friendlyName.toLowerCase();
-							const idLower = state.entity_id.toLowerCase();
-							if (nameLower.includes("wled") || idLower.includes("wled") || 
-								nameLower.includes("clock") || idLower.includes("clock")) {
-								return; 
-							}
-						}
-
 						const supportsColor = colorModes.includes("rgb") || colorModes.includes("rgbw") || colorModes.includes("hs") || colorModes.includes("xy");
-						const supportsBrightness = colorModes.includes("brightness") || supportsColor;
+						const supportsBrightness = supportsColor || colorModes.includes("brightness") || colorModes.includes("color_temp");
 
 						if (supportsColor || supportsBrightness) {
 							this.lights.push({
 								id: state.entity_id,
 								name: friendlyName,
+								fps: allowedLights[entityId] || 5, 
+								lastRenderTime: 0,                 
 								supportsColor: supportsColor,
 								supportsBrightness: supportsBrightness,
 								lastColor: [-1, -1, -1] 
@@ -96,14 +91,12 @@ class HomeAssistantDevice {
 					}
 				});
 
-				// Capital 'S' to prevent crashes
 				device.SetLedLimit(this.lights.length);
 				this.lights.forEach(light => {
-					// Add channel by entity_id, not friendly name, to prevent invalid character crashes
 					device.addChannel(light.id, 1);
 				});
 
-				device.log(`Successfully mapped ${this.lights.length} HA lights to SignalRGB.`);
+				device.log(`Successfully mapped ${this.lights.length} selected Home Assistant lights.`);
 			} else {
 				device.log("HA API returned status: " + xhr.status);
 			}
@@ -115,48 +108,55 @@ class HomeAssistantDevice {
 	updateColors() {
 		if (this.lights.length === 0) return;
 
-		// Safe checks for Lighting properties
 		const currentMode = typeof LightingMode !== "undefined" ? LightingMode : "Canvas";
 		const currentColor = typeof forcedColor !== "undefined" ? forcedColor : "#009bde";
+		const now = Date.now();
 
 		this.lights.forEach(light => {
-			const channel = device.channel(light.id);
-			if (!channel) return;
+			const safeFPS = light.fps > 0 ? light.fps : 5;
+			const frameDelay = 1000 / safeFPS;
+			
+			if (now - light.lastRenderTime >= frameDelay) {
+				light.lastRenderTime = now;
 
-			let RGBData = [];
+				const channel = device.channel(light.id);
+				if (!channel) return;
 
-			if (currentMode === "Forced") {
-				RGBData = device.createColorArray(currentColor, 1, "Inline");
-			} else if (channel.shouldPulseColors()) {
-				const pulseColor = device.getChannelPulseColor(light.id);
-				RGBData = device.createColorArray(pulseColor, 1, "Inline");
-			} else {
-				RGBData = channel.getColors("Inline");
-			}
+				let RGBData = [];
 
-			if (RGBData.length >= 3) {
-				const r = RGBData[0];
-				const g = RGBData[1];
-				const b = RGBData[2];
+				if (currentMode === "Forced") {
+					RGBData = device.createColorArray(currentColor, 1, "Inline");
+				} else if (channel.shouldPulseColors()) {
+					const pulseColor = device.getChannelPulseColor(light.id);
+					RGBData = device.createColorArray(pulseColor, 1, "Inline");
+				} else {
+					RGBData = channel.getColors("Inline");
+				}
 
-				if (r !== light.lastColor[0] || g !== light.lastColor[1] || b !== light.lastColor[2]) {
-					light.lastColor = [r, g, b];
+				if (RGBData.length >= 3) {
+					const r = RGBData[0];
+					const g = RGBData[1];
+					const b = RGBData[2];
 
-					const isOff = (r === 0 && g === 0 && b === 0);
-					const endpoint = isOff ? "/api/services/light/turn_off" : "/api/services/light/turn_on";
-					let payload = { "entity_id": light.id };
+					if (r !== light.lastColor[0] || g !== light.lastColor[1] || b !== light.lastColor[2]) {
+						light.lastColor = [r, g, b];
 
-					if (!isOff) {
-						if (light.supportsColor) {
-							payload["rgb_color"] = [r, g, b];
+						const isOff = (r === 0 && g === 0 && b === 0);
+						const endpoint = isOff ? "/api/services/light/turn_off" : "/api/services/light/turn_on";
+						let payload = { "entity_id": light.id };
+
+						if (!isOff) {
+							if (light.supportsColor) {
+								payload["rgb_color"] = [r, g, b];
+							}
+							
+							if (light.supportsBrightness) {
+								payload["brightness"] = Math.max(r, g, b); 
+							}
 						}
-						
-						if (light.supportsBrightness) {
-							payload["brightness"] = Math.max(r, g, b); 
-						}
+
+						XmlHttp.Post(`${this.url}${endpoint}`, this.token, payload, null, true);
 					}
-
-					XmlHttp.Post(`${this.url}${endpoint}`, this.token, payload, null, true);
 				}
 			}
 		});
@@ -178,16 +178,8 @@ export function Initialize() {
 }
 
 export function Render() {
-	// Safely check if FPSLimit exists, default to 5 if it doesn't
-	const safeFPS = typeof FPSLimit !== "undefined" ? FPSLimit : 5;
-	const frameDelay = 1000 / safeFPS;
-	const now = Date.now();
-	
-	if (now - lastRenderTime >= frameDelay) {
-		lastRenderTime = now;
-		if (HA_DEVICE) {
-			HA_DEVICE.updateColors();
-		}
+	if (HA_DEVICE) {
+		HA_DEVICE.updateColors();
 	}
 }
 
@@ -225,10 +217,10 @@ class XmlHttp {
 }
 
 export function DiscoveryService() {
-	this.MDns = []; // mDNS removed to prevent empty ghost instances
+	this.MDns = [ "_home-assistant._tcp.local." ]; 
 
 	this.Initialize = function() {
-		service.log("Initializing Home Assistant Plugin...");
+		service.log("Initializing Home Assistant Bridge Plugin...");
 		this.loadSavedCredentials();
 	};
 
@@ -236,13 +228,14 @@ export function DiscoveryService() {
 		const savedUrl = service.getSetting("HA_Config", "url");
 		const savedToken = service.getSetting("HA_Config", "token");
 		const savedEntities = service.getSetting("HA_Config", "entities") || "";
+		const savedGroups = service.getSetting("HA_Config", "filterGroups") || "true";
 		
 		if (savedUrl && savedToken) {
-			this.setCredentials(savedUrl, savedToken, savedEntities);
+			this.setCredentials(savedUrl, savedToken, savedEntities, savedGroups === "true", false);
 		}
 	};
 
-	this.setCredentials = function(url, token, entities) {
+	this.setCredentials = function(url, token, entities, filterGroups, autoLink = false) {
 		if (!url || !token) return;
 
 		let cleanUrl = url.trim();
@@ -253,45 +246,96 @@ export function DiscoveryService() {
 			cleanUrl = cleanUrl.slice(0, -1);
 		}
 
-		service.log(`Testing connection to ${cleanUrl}...`);
+		service.log(`Authenticating with Home Assistant at ${cleanUrl}...`);
 
 		XmlHttp.Get(`${cleanUrl}/api/config`, token, (xhr) => {
 			if (xhr.readyState === 4) {
 				if (xhr.status === 200 || xhr.status === 201) {
-					service.log("Successfully connected to Home Assistant!");
-					const data = JSON.parse(xhr.response);
+					service.log("Authentication successful! Building dynamic entity list...");
+					const configData = JSON.parse(xhr.response);
+					
+					let finalEntities = entities;
+					if (finalEntities === undefined || finalEntities === null || finalEntities === "") {
+						finalEntities = service.getSetting("HA_Config", "entities") || "";
+					}
+					
+					let finalFilterGroups = filterGroups;
+					if (finalFilterGroups === undefined || finalFilterGroups === null) {
+						finalFilterGroups = service.getSetting("HA_Config", "filterGroups") !== "false";
+					}
 					
 					service.saveSetting("HA_Config", "url", cleanUrl);
 					service.saveSetting("HA_Config", "token", token);
-					service.saveSetting("HA_Config", "entities", entities || ""); 
-
-					// LIVE UPDATE FEATURE: Push updates immediately without restarting SignalRGB
-					if (typeof HA_DEVICE !== "undefined" && HA_DEVICE !== null) {
-						service.log("Pushing live entity updates to running device...");
-						HA_DEVICE.url = cleanUrl;
-						HA_DEVICE.token = token;
-						HA_DEVICE.targetEntities = entities || "";
-						HA_DEVICE.initializeChannels();
-					}
+					service.saveSetting("HA_Config", "entities", finalEntities); 
+					service.saveSetting("HA_Config", "filterGroups", finalFilterGroups ? "true" : "false");
 
 					const discoveryPayload = {
 						hostname: cleanUrl,
-						name: data.location_name || "Home Assistant",
-						mac: data.uuid || cleanUrl, 
+						name: configData.location_name || "Home Assistant",
+						mac: configData.uuid || cleanUrl, 
 						token: token,
-						entities: entities || "",
+						entities: finalEntities,
+						filterGroups: finalFilterGroups,
+						autoLink: autoLink, 
 						forced: true
 					};
 
+					for (let i = service.controllers.length - 1; i >= 0; i--) {
+						const cont = service.controllers[i];
+						if (cont.id !== discoveryPayload.mac) {
+							service.suppressController(cont);
+							service.removeController(cont);
+						}
+					}
+
 					this.Discovered(discoveryPayload);
 				} else {
-					service.log(`Failed to authorize with Home Assistant. Status Code: ${xhr.status}`);
+					service.log(`Authorization failed. Check your Long-Lived Access Token. HTTP Status: ${xhr.status}`);
 				}
 			}
 		});
 	};
 
 	this.Discovered = function(value) {
+		if (!value.forced && value.hostname) {
+			let cleanUrl = value.hostname;
+			if (!cleanUrl.startsWith("http://") && !cleanUrl.startsWith("https://")) {
+				cleanUrl = "http://" + cleanUrl;
+			}
+			if (value.port && !cleanUrl.match(/:\d+\/?$/)) {
+				cleanUrl += ":" + value.port;
+			}
+			
+			cleanUrl = cleanUrl.replace(/\.local\.:/g, '.local:');
+			if (cleanUrl.endsWith('.local.')) cleanUrl = cleanUrl.slice(0, -1);
+			value.hostname = cleanUrl;
+			
+			if (!value.token) value.token = service.getSetting("HA_Config", "token") || "";
+			if (!value.entities) value.entities = service.getSetting("HA_Config", "entities") || "";
+			if (value.filterGroups === undefined) value.filterGroups = service.getSetting("HA_Config", "filterGroups") !== "false";
+
+			if (value.token) {
+				try {
+					const xhr = new XMLHttpRequest();
+					xhr.open("GET", `${cleanUrl}/api/config`, false); 
+					xhr.setRequestHeader("Accept", "application/json");
+					xhr.setRequestHeader("Content-Type", "application/json");
+					xhr.setRequestHeader("Authorization", "Bearer " + value.token);
+					xhr.send();
+					
+					if (xhr.status === 200 || xhr.status === 201) {
+						const configData = JSON.parse(xhr.response);
+						if (configData.uuid) {
+							value.mac = configData.uuid; 
+							value.name = configData.location_name || value.name;
+						}
+					} else {
+						value.token = ""; 
+					}
+				} catch (e) {}
+			}
+		}
+
 		const controller = service.getController(value.mac);
 
 		if (controller === undefined) {
@@ -307,20 +351,32 @@ export function DiscoveryService() {
 		}
 	};
 
-    this.deleteBridge = function(bridgeId) {
-		service.log("Deleting Bridge and clearing saved data...");
-		service.removeSetting("HA_Config", "url");
-		service.removeSetting("HA_Config", "token");
-		service.removeSetting("HA_Config", "entities");
-		service.removeSetting("HA_Linked", "id");
+	this.forgetBridge = function(bridgeId) {
+		service.log("Forgetting Home Assistant Bridge: " + bridgeId);
 
-		// Loop through the UI controllers and explicitly remove the matching one
-		for (const controller of service.controllers) {
-			if (controller.id === bridgeId) {
-				service.suppressController(controller);
-				service.removeController(controller);
-				return;
+		let wasLinked = false;
+		
+		// 1. Loop through and delete ONLY the specific bridge you clicked on
+		for (let i = service.controllers.length - 1; i >= 0; i--) {
+			const cont = service.controllers[i];
+			if (cont.id === bridgeId) {
+				if (cont.obj.connected) {
+					wasLinked = true;
+				}
+				service.suppressController(cont);
+				service.removeController(cont);
 			}
+		}
+
+		// 2. Only wipe out your saved Token and Settings if you forgot the Active bridge
+		//    (or if it was the absolute last bridge on the screen).
+		if (wasLinked || service.controllers.length === 0) {
+			service.log("Clearing saved HA credentials...");
+			service.removeSetting("HA_Config", "url");
+			service.removeSetting("HA_Config", "token");
+			service.removeSetting("HA_Config", "entities");
+			service.removeSetting("HA_Config", "filterGroups");
+			service.removeSetting("HA_Linked", "id");
 		}
 	};
 }
@@ -328,13 +384,14 @@ export function DiscoveryService() {
 class HABridge {
 	constructor(value) {
 		this.url = value.hostname;
-		this.token = value.token;
-		this.entities = value.entities;
-		this.name = value.name;
+		this.token = value.token || "";
+		this.entities = value.entities || "";
+		this.filterGroups = value.filterGroups !== undefined ? value.filterGroups : true;
+		this.name = value.name || "Home Assistant";
 		this.mac = value.mac;
 		this.id = value.mac;
 		this.ip = value.hostname; 
-		this.forced = value.forced;
+		this.forced = value.forced || false;
 		this.deviceledcount = 0;
 		this.connected = false;
 		this.offline = false;
@@ -342,23 +399,42 @@ class HABridge {
 		this.announced = false;
 		this.lastUpdate = Date.now();
 
+		this.availableEntitiesJson = "[]"; 
+
 		const linkedId = service.getSetting("HA_Linked", "id");
 		if (linkedId === this.id) {
 			this.connected = true;
 		}
 
 		service.log(`Bridge Constructed: ${this.name}`);
-		this.getDeviceStats();
+		this.getAllHAEntities();
 	}
 
 	updateWithValue(value) {
+		const entitiesChanged = this.entities !== value.entities;
+		const groupFilterChanged = this.filterGroups !== value.filterGroups;
+		const needsRestart = entitiesChanged || groupFilterChanged;
+
 		this.url = value.hostname;
-		this.token = value.token;
-		this.entities = value.entities;
+		if (value.token !== undefined) this.token = value.token;
+		if (value.entities !== undefined) this.entities = value.entities;
+		if (value.filterGroups !== undefined) this.filterGroups = value.filterGroups;
 		this.name = value.name;
 		this.ip = value.hostname;
+		
 		service.updateController(this);
-		this.getDeviceStats();
+		this.getAllHAEntities();
+
+		if (this.connected) {
+			if (needsRestart) {
+				service.log("Settings changed! Restarting canvas device to pull new channels...");
+				service.suppressController(this);
+				service.announceController(this);
+			}
+		} else if (value.autoLink) {
+			service.log("Auto-linking after saving settings...");
+			this.startLink();
+		}
 	}
 
 	update() {
@@ -373,27 +449,88 @@ class HABridge {
 		const currentTime = Date.now();
 		if (currentTime - this.lastUpdate >= 60000) {
 			this.lastUpdate = currentTime;
-			this.getDeviceStats();
+			this.getAllHAEntities();
 		}
 	}
 
-	getDeviceStats() {
-		const allowedLights = this.entities ? this.entities.split(',').map(s => s.trim().toLowerCase()).filter(s => s.length > 0) : [];
+	getAllHAEntities() {
+		if (!this.token || !this.url) return;
+
+		let areaMap = {};
+		const tplXhr = new XMLHttpRequest();
+		tplXhr.open("POST", `${this.url}/api/template`, false); 
+		tplXhr.setRequestHeader("Accept", "application/json");
+		tplXhr.setRequestHeader("Content-Type", "application/json");
+		tplXhr.setRequestHeader("Authorization", "Bearer " + this.token);
+		
+		try {
+			tplXhr.send(JSON.stringify({template: "{% for state in states.light %}{{ state.entity_id }}|{{ area_name(state.entity_id) | default('Allgemein', true) }}::{% endfor %}"}));
+			if (tplXhr.status === 200) {
+				const responseText = tplXhr.response || tplXhr.responseText;
+				const pairs = responseText.split("::");
+				pairs.forEach(p => {
+					const parts = p.split("|");
+					if (parts.length === 2) {
+						areaMap[parts[0]] = (parts[1] === "None" || parts[1].trim() === "") ? "Allgemein" : parts[1].trim();
+					}
+				});
+			}
+		} catch(e) {}
 
 		XmlHttp.Get(`${this.url}/api/states`, this.token, (xhr) => {
 			if (xhr.readyState === 4) {
 				if (xhr.status === 200) {
 					try {
 						const states = JSON.parse(xhr.response);
-						let count = 0;
-						states.forEach(s => {
-							if (s.entity_id.startsWith("light.")) {
-								if (allowedLights.length === 0 || allowedLights.includes(s.entity_id.toLowerCase())) {
-									count++;
+						let fullList = [];
+						let mappedCount = 0;
+
+						let allowedLights = {};
+						if (this.entities) {
+							try {
+								allowedLights = JSON.parse(this.entities);
+							} catch(e) {
+								const arr = this.entities.split(',').map(s => s.trim().toLowerCase()).filter(s => s.length > 0);
+								arr.forEach(id => { allowedLights[id] = 5; });
+							}
+						}
+
+						states.forEach(state => {
+							if (state.entity_id.startsWith("light.")) {
+								const attrs = state.attributes || {};
+								const friendlyName = attrs.friendly_name || state.entity_id;
+								const colorModes = attrs.supported_color_modes || [];
+
+								if (this.filterGroups) {
+									if (attrs.hasOwnProperty("entity_id")) {
+										return;
+									}
+								}
+
+								const supportsColor = colorModes.includes("rgb") || colorModes.includes("rgbw") || colorModes.includes("hs") || colorModes.includes("xy");
+								const supportsBrightness = supportsColor || colorModes.includes("brightness") || colorModes.includes("color_temp");
+
+								if (supportsColor || supportsBrightness) {
+									const isChecked = allowedLights.hasOwnProperty(state.entity_id.toLowerCase());
+									fullList.push({
+										id: state.entity_id,
+										name: friendlyName,
+										area: areaMap[state.entity_id.toLowerCase()] || "Allgemein",
+										checked: isChecked,
+										fps: isChecked ? allowedLights[state.entity_id.toLowerCase()] : 5
+									});
+									
+									if (isChecked) {
+										mappedCount++;
+									}
 								}
 							}
 						});
-						this.deviceledcount = count;
+						
+						fullList.sort((a, b) => a.area.localeCompare(b.area) || a.name.localeCompare(b.name));
+
+						this.availableEntitiesJson = JSON.stringify(fullList);
+						this.deviceledcount = mappedCount;
 						this.offline = false;
 						service.updateController(this);
 					} catch (e) {}
