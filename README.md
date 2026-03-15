@@ -12,6 +12,7 @@ This plugin dynamically fetches your Home Assistant lights, automatically groups
 * **Area Grouping:** Automatically categorizes your lights based on their assigned Home Assistant "Areas" (Rooms).
 * **Per-Entity FPS Control:** Assign independent update rates (FPS) to every single light to prevent overloading your smart home network.
 * **Smart Filtering:** Built-in toggles to automatically hide Light Groups to keep your interface clean.
+* **State Restoration:** Takes a snapshot of your lights' exact state (brightness, RGB, or true white Kelvin temperature) before SignalRGB takes control, and restores them perfectly when you quit.
 * **Full Canvas Support:** Extracts brightness and RGB intents directly from SignalRGB's canvas and translates them into native Home Assistant API calls.
 
 ## 📋 Prerequisites
@@ -21,12 +22,14 @@ This plugin dynamically fetches your Home Assistant lights, automatically groups
 
 ## 🚀 Installation
 
-1. Open your terminal or command prompt.
-2. Navigate to your SignalRGB plugins folder, typically located at:
-   `cd Documents\WhirlwindFX\Plugins\`
-3. Clone this repository directly into the folder:
-   `git clone https://github.com/Luk-Krn/signalrgb-homeassistant-plugin.git`
-4. Completely **Quit and Restart SignalRGB** (Right-click the icon in the system tray -> Quit).
+Installing is incredibly easy using SignalRGB's built-in Add-on manager:
+
+1. Open **SignalRGB** and click the **Settings** gear icon in the bottom left corner.
+2. Navigate to the **Add-ons** tab.
+3. Click the **+ Add-on** button.
+4. Paste the following repository link:
+   `https://github.com/Luk-Krn/signalrgb-homeassistant-plugin.git`
+5. Completely **Quit and Restart SignalRGB** (Right-click the icon in the system tray -> Quit).
 
 ## 🔑 Getting Your Home Assistant Token
 To allow SignalRGB to communicate with your Home Assistant server, you must provide a Long-Lived Access Token:
