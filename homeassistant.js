@@ -1,5 +1,5 @@
 export function Name() { return "Home Assistant Bridge"; }
-export function Version() { return "1.9.1"; }
+export function Version() { return "1.11.0"; }
 export function Type() { return "network"; }
 export function Publisher() { return "SignalRGB Community"; }
 export function Size() { return [10, 10]; }
@@ -78,6 +78,24 @@ class HomeAssistantDevice {
 						const supportsBrightness = supportsColor || colorModes.includes("brightness") || colorModes.includes("color_temp");
 
 						if (supportsColor || supportsBrightness) {
+							
+							let initialState = { state: state.state };
+							if (state.state === "on") {
+								if (attrs.brightness !== undefined) initialState.brightness = attrs.brightness;
+								
+								if (attrs.color_mode === "color_temp" || (attrs.color_temp_kelvin !== undefined && attrs.color_temp_kelvin !== null)) {
+									if (attrs.color_temp_kelvin !== undefined && attrs.color_temp_kelvin !== null) {
+										initialState.color_temp_kelvin = attrs.color_temp_kelvin;
+									} else if (attrs.color_temp !== undefined && attrs.color_temp !== null) {
+										initialState.color_temp = attrs.color_temp;
+									}
+								} else {
+									if (attrs.rgb_color !== undefined && attrs.rgb_color !== null) initialState.rgb_color = attrs.rgb_color;
+									else if (attrs.hs_color !== undefined && attrs.hs_color !== null) initialState.hs_color = attrs.hs_color;
+									else if (attrs.xy_color !== undefined && attrs.xy_color !== null) initialState.xy_color = attrs.xy_color;
+								}
+							}
+
 							this.lights.push({
 								id: state.entity_id,
 								name: friendlyName,
@@ -85,7 +103,8 @@ class HomeAssistantDevice {
 								lastRenderTime: 0,                 
 								supportsColor: supportsColor,
 								supportsBrightness: supportsBrightness,
-								lastColor: [-1, -1, -1] 
+								lastColor: [-1, -1, -1],
+								initialState: initialState 
 							});
 						}
 					}
@@ -166,7 +185,26 @@ class HomeAssistantDevice {
 		if (this.lights.length === 0) return;
 		this.lights.forEach(light => {
 			let payload = { "entity_id": light.id };
-			XmlHttp.Post(`${this.url}/api/services/light/turn_off`, this.token, payload, null, false);
+			
+			if (light.initialState && light.initialState.state === "on") {
+				if (light.initialState.brightness !== undefined) payload.brightness = light.initialState.brightness;
+				
+				if (light.initialState.color_temp_kelvin !== undefined) {
+					payload.color_temp_kelvin = light.initialState.color_temp_kelvin;
+				} else if (light.initialState.color_temp !== undefined) {
+					payload.color_temp = light.initialState.color_temp;
+				} else if (light.initialState.rgb_color !== undefined) {
+					payload.rgb_color = light.initialState.rgb_color;
+				} else if (light.initialState.hs_color !== undefined) {
+					payload.hs_color = light.initialState.hs_color;
+				} else if (light.initialState.xy_color !== undefined) {
+					payload.xy_color = light.initialState.xy_color;
+				}
+				
+				XmlHttp.Post(`${this.url}/api/services/light/turn_on`, this.token, payload, null, false);
+			} else {
+				XmlHttp.Post(`${this.url}/api/services/light/turn_off`, this.token, payload, null, false);
+			}
 		});
 	}
 }
@@ -356,7 +394,6 @@ export function DiscoveryService() {
 
 		let wasLinked = false;
 		
-		// 1. Loop through and delete ONLY the specific bridge you clicked on
 		for (let i = service.controllers.length - 1; i >= 0; i--) {
 			const cont = service.controllers[i];
 			if (cont.id === bridgeId) {
@@ -368,8 +405,6 @@ export function DiscoveryService() {
 			}
 		}
 
-		// 2. Only wipe out your saved Token and Settings if you forgot the Active bridge
-		//    (or if it was the absolute last bridge on the screen).
 		if (wasLinked || service.controllers.length === 0) {
 			service.log("Clearing saved HA credentials...");
 			service.removeSetting("HA_Config", "url");
